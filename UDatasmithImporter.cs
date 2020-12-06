@@ -23,17 +23,17 @@ public class UDatasmithImporter : ScriptedImporter {
   public bool m_ImportLights = true;
   [Tooltip("Set up translated lights for static lightmap baking")]
   public bool m_SetupLightmapBaking = true;
-  [Tooltip("Set up VRChat networked physics props for translated actors based on Revit Category attribute")]
+  [Tooltip("Set up VRChat networked physics props for translated actors based on Revit Layer attribute")]
   public bool m_SetupPhysicsProps = false;
 
-  [Tooltip("Revit Categories to be mapped as static objects with Mesh colliders. (Regular expression, case-insensitive)")]
-  public string m_StaticTangibleCategoryRegex = @"Roof|Topography|Furniture|Stairs|Levels|Walls|Structural|Floors|Site|Pads|Ramps|Ceilings|Casework|Parking|Parts|Pipes|Pipe Fitting|Gutters|Fascia";
-  [Tooltip("Revit Categories to be mapped as static, intangible (no collision) objects. (Regular expression, case-insensitive)")]
-  public string m_StaticIntangibleCategoryRegex = @"Windows|Doors|Specialty Equipment|Plumbing|Electrical|Curtain|Railings|Top Rails|Lighting Fixtures|Mechanical|Equipment";
-  [Tooltip("Revit Categories to be mapped as physics props. (Regular expression, case-insensitive)")]
-  public string m_PhysicsPropsCategoryRegex = @"Generic Models";
-  [Tooltip("Revit Categories to import as disabled GameObjects. (Regular expression, case-insensitive)")]
-  public string m_IgnoredCategoryRegex = @"Entourage|Planting";
+  [Tooltip("Revit Layers to be mapped as static objects with Mesh colliders. (Regular expression, case-insensitive)")]
+  public string m_StaticTangibleLayerRegex = @"Roof|Topography|Furniture|Stairs|Levels|Walls|Structural|Floors|Site|Pads|Ramps|Ceilings|Casework|Parking|Parts|Pipes|Pipe Fitting|Gutters|Fascia";
+  [Tooltip("Revit Layers to be mapped as static, intangible (no collision) objects. (Regular expression, case-insensitive)")]
+  public string m_StaticIntangibleLayerRegex = @"Windows|Doors|Specialty Equipment|Plumbing|Electrical|Curtain|Railings|Top Rails|Lighting Fixtures|Mechanical|Equipment";
+  [Tooltip("Revit Layers to be mapped as physics props. (Regular expression, case-insensitive)")]
+  public string m_PhysicsPropsLayerRegex = @"Generic Models";
+  [Tooltip("Revit Layers to import as disabled GameObjects. (Regular expression, case-insensitive)")]
+  public string m_IgnoredLayerRegex = @"Entourage|Planting";
 
 
   class UdsStaticMesh {
@@ -98,11 +98,26 @@ public class UDatasmithImporter : ScriptedImporter {
       tex.name = node.Attributes["name"].Value;
       tex.filePath = node.Attributes["file"].Value;
 
+      if (Regex.Match(tex.filePath, @"\.ies$", RegexOptions.IgnoreCase).Success) {
+        ctx.LogImportWarning(String.Format("Texture Reference \"{0}\" to IES light profile \"{1}\" cannot be resolved: IES light profile import is not implemented.", tex.name, tex.filePath));
+        return null;
+      }
+
 
       tex.fullyQualifiedPath = Path.Combine(Path.GetDirectoryName(ctx.assetPath), tex.filePath);
-      tex.assetRef = (Texture)AssetDatabase.LoadAssetAtPath(tex.fullyQualifiedPath, typeof(Texture));
 
-      tex.importer = (TextureImporter) AssetImporter.GetAtPath(tex.fullyQualifiedPath); // load import settings for possible later adjustment once we know what this will be used for
+      var texAssetObj = AssetDatabase.LoadAssetAtPath(tex.fullyQualifiedPath, typeof(Texture));
+      if (texAssetObj != null) {
+        tex.assetRef = (Texture)texAssetObj;
+        var texImporterObj = AssetImporter.GetAtPath(tex.fullyQualifiedPath); // load import settings for possible later adjustment once we know what this will be used for
+        if (texImporterObj != null) {
+          tex.importer = (TextureImporter)texImporterObj;
+        }
+      }
+
+      if (tex.assetRef == null || tex.importer == null) {
+        ctx.LogImportError(String.Format("UdsTexture::FromNode: Asset does not exist at path \"{0}\"", tex.fullyQualifiedPath));
+      }
 
       return tex;
     }
@@ -194,7 +209,7 @@ public class UDatasmithImporter : ScriptedImporter {
         } else if (keyName == "DiffuseMap") {
           Debug.Assert(kvpNode.Attributes["type"].Value == "Texture");
           UdsTexture texRef;
-          textureElements.TryGetValue(kvpNode.Attributes["val"].Value.ToLowerInvariant(), out texRef);
+          textureElements.TryGetValue(kvpNode.Attributes["val"].Value, out texRef);
           if (texRef == null) {
             ctx.LogImportError(String.Format("Missing diffuse texref \"{0}\" while assembling material node \"{1}\"", kvpNode.Attributes["val"].Value, m.name));
           } else {
@@ -208,7 +223,7 @@ public class UDatasmithImporter : ScriptedImporter {
         } else if (keyName == "BumpMap") {
           Debug.Assert(kvpNode.Attributes["type"].Value == "Texture");
           UdsTexture texRef;
-          textureElements.TryGetValue(kvpNode.Attributes["val"].Value.ToLowerInvariant(), out texRef);
+          textureElements.TryGetValue(kvpNode.Attributes["val"].Value, out texRef);
           if (texRef == null) {
             ctx.LogImportError(String.Format("Missing bump texref \"{0}\" while assembling material node \"{1}\"", kvpNode.Attributes["val"].Value, m.name));
           } else {
@@ -324,7 +339,7 @@ public class UDatasmithImporter : ScriptedImporter {
           String meshName = meshNode.Attributes["name"].Value;
           UdsStaticMesh mesh;
 
-          staticMeshElements.TryGetValue(meshName.ToLowerInvariant(), out mesh);
+          staticMeshElements.TryGetValue(meshName, out mesh);
           Debug.Assert(mesh != null, String.Format("Missing StaticMesh node for \"{0}\" referenced from ActorMesh node \"{1}\"", meshName, node.Attributes["name"].Value));
           if (mesh.assetRef) {
             MeshFilter mf = obj.AddComponent<MeshFilter>();
@@ -338,30 +353,35 @@ public class UDatasmithImporter : ScriptedImporter {
             MeshRenderer mr = obj.AddComponent<MeshRenderer>();
             mr.sharedMaterials = mats;
 
-            Dictionary<String, String> metadata = new Dictionary<string, string>();
-            actorMetadata.TryGetValue(node.Attributes["name"].Value.ToLowerInvariant(), out metadata);
+            String RevitLayer = node.Attributes["layer"].Value;
+            //Dictionary<String, String> metadata = new Dictionary<string, string>();
+            //actorMetadata.TryGetValue(node.Attributes["name"].Value, out metadata);
 
             // Process imported metadata and try to do something reasonable with it
             {
-              String RevitCategory;
-              metadata.TryGetValue("Element_Category", out RevitCategory);
-              if (RevitCategory != null) {
+              //String RevitCategory;
+              //metadata.TryGetValue("Element_Category", out RevitCategory);
+              if (RevitLayer != null) {
 
-                if (Regex.Match(RevitCategory, @"Ceilings", RegexOptions.IgnoreCase).Success) {
+                if (Regex.Match(RevitLayer, @"Ceilings", RegexOptions.IgnoreCase).Success) {
                   // Apply ceiling height offset
                   Vector3 p = obj.transform.position;
                   p.z += m_CeilingHeightOffset;
                   obj.transform.position = p;
                 }
 
-                if (Regex.Match(RevitCategory, @"Floors", RegexOptions.IgnoreCase).Success) {
+                if (Regex.Match(RevitLayer, @"Floors", RegexOptions.IgnoreCase).Success) {
                   // Apply floor height offset
                   Vector3 p = obj.transform.position;
                   p.z += m_FloorHeightOffset;
                   obj.transform.position = p;
                 }
 
-                if (Regex.Match(RevitCategory, m_StaticTangibleCategoryRegex, RegexOptions.IgnoreCase).Success) {
+
+                if (Regex.Match(RevitLayer, m_IgnoredLayerRegex, RegexOptions.IgnoreCase).Success) {
+                  // Default-hidden objects. For example, "Entourage" and "Planting" objects are not exported correctly by Datasmith (no materials/textures), so we hide them.
+                  obj.SetActive(false);
+                } else if (Regex.Match(RevitLayer, m_StaticTangibleLayerRegex, RegexOptions.IgnoreCase).Success) {
                   // Completely static objects that should be lightmapped and have collision enabled
                   GameObjectUtility.SetStaticEditorFlags(obj, StaticEditorFlags.LightmapStatic | StaticEditorFlags.OccludeeStatic | StaticEditorFlags.OccluderStatic | StaticEditorFlags.BatchingStatic | StaticEditorFlags.ReflectionProbeStatic);
 
@@ -369,11 +389,11 @@ public class UDatasmithImporter : ScriptedImporter {
                   MeshCollider collider = obj.AddComponent<MeshCollider>();
                   collider.cookingOptions = (MeshColliderCookingOptions.CookForFasterSimulation | MeshColliderCookingOptions.EnableMeshCleaning | MeshColliderCookingOptions.WeldColocatedVertices);
 
-                } else if (Regex.Match(RevitCategory, m_StaticIntangibleCategoryRegex, RegexOptions.IgnoreCase).Success) {
+                } else if (Regex.Match(RevitLayer, m_StaticIntangibleLayerRegex, RegexOptions.IgnoreCase).Success) {
                   // Completely static objects that should be lightmapped, but don't need collision
                   GameObjectUtility.SetStaticEditorFlags(obj, StaticEditorFlags.LightmapStatic | StaticEditorFlags.OccludeeStatic | StaticEditorFlags.OccluderStatic | StaticEditorFlags.BatchingStatic | StaticEditorFlags.ReflectionProbeStatic);
 
-                } else if (Regex.Match(RevitCategory, m_PhysicsPropsCategoryRegex).Success) {
+                } else if (Regex.Match(RevitLayer, m_PhysicsPropsLayerRegex).Success) {
                   // Clutter that can be physics-enabled
 
                   MeshCollider collider = obj.AddComponent<MeshCollider>();
@@ -403,15 +423,11 @@ public class UDatasmithImporter : ScriptedImporter {
 #endif
 
 
-                } else if (Regex.Match(RevitCategory, m_IgnoredCategoryRegex, RegexOptions.IgnoreCase).Success) {
-                  // "Entourage" and "Planting" objects are not exported correctly by Datasmith (no materials/textures), so we hide them.
-                  obj.SetActive(false);
-
                 } else {
-                  ctx.LogImportWarning(String.Format("Unhandled Element_Category \"{0}\" -- ActorMesh \"{1}\" will not have physics and lighting behaviours automatically mapped", RevitCategory, objName));
+                  ctx.LogImportWarning(String.Format("Unhandled Layer \"{0}\" -- ActorMesh \"{1}\" will not have physics and lighting behaviours automatically mapped", RevitLayer, objName));
                 }
 
-                if (Regex.Match(RevitCategory, @"Lighting").Success) {
+                if (Regex.Match(RevitLayer, @"Lighting").Success) {
                   // Turn off shadow casting on light fixtures. Light sources are usually placed inside the fixture body and we don't want the fixture geometry to block them.
                   mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
                 }
@@ -515,19 +531,21 @@ public class UDatasmithImporter : ScriptedImporter {
       foreach (XmlNode kvpNode in metadataNode.SelectNodes("child::KeyValueProperty")) {
         metadata.Add(kvpNode.Attributes["name"].Value, kvpNode.Attributes["val"].Value);
       }
-      actorMetadata.Add(actorId.ToLowerInvariant(), metadata);
+      actorMetadata.Add(actorId, metadata);
     }
 
     // Import textures
     foreach (XmlNode node in rootElement.SelectNodes("child::Texture")) {
       UdsTexture tex = UdsTexture.FromNode(ctx, node);
-      textureElements.Add(tex.name.ToLowerInvariant(), tex);
+      if (tex != null) {
+        textureElements.Add(tex.name, tex);
+      }
     }
 
     // Import materials
     foreach (XmlNode node in rootElement.SelectNodes("child::MasterMaterial")) {
       UdsMaterial m = UdsMaterial.FromNode(ctx, node, textureElements);
-      materialElements.Add(m.name.ToLowerInvariant(), m);
+      materialElements.Add(m.name, m);
     }
 
     // Import StaticMesh nodes and crossreference materials
@@ -536,13 +554,13 @@ public class UDatasmithImporter : ScriptedImporter {
 
       for (int materialIdx = 0; materialIdx < m.materialNames.Count; ++materialIdx) {
         UdsMaterial mat;
-        if (!materialElements.TryGetValue(m.materialNames[materialIdx].ToLowerInvariant(), out mat)) {
+        if (!materialElements.TryGetValue(m.materialNames[materialIdx], out mat)) {
           ctx.LogImportError(String.Format("Can't resolve Material ref \"{0}\"", m.materialNames[materialIdx]));
         }
         m.materialRefs.Add(mat);
       }
 
-      staticMeshElements.Add(m.name.ToLowerInvariant(), m);
+      staticMeshElements.Add(m.name, m);
 
     }
 
